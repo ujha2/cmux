@@ -1,0 +1,2 @@
+[console_scripts]
+cmux = cmux.core.cli:app
