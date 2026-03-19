@@ -7,12 +7,24 @@ cmux is a command center for managing parallel AI sessions alongside your own wo
 ## Installation
 
 ```bash
-# Clone and install
+# Clone and install (recommended)
 cd /path/to/cmux
-pip install -e .
+./install.sh
 
 # Verify
 cmux --help
+```
+
+Manual install (advanced):
+
+```bash
+pip install -e .
+```
+
+If your distro Python is PEP 668 externally managed (common on Ubuntu/WSL), use:
+
+```bash
+pip install --break-system-packages -e .
 ```
 
 **Requirements:**
@@ -405,6 +417,92 @@ Notifications fire automatically when cmux checks pane status (during `status`, 
 
 ---
 
+## Microsoft WorkIQ Integration
+
+cmux can pull your Microsoft WorkIQ task signals (assigned tasks, important emails/messages, meeting prep, and focus recommendations) and turn them into queue items.
+
+### First-time setup
+
+On first run (`cmux` with no existing config), cmux automatically configures WorkIQ MCP.
+
+It:
+- registers an MCP server named `workiq` in `~/.claude/settings.json`
+  using command transport (`npx -y @microsoft/workiq@latest mcp`)
+
+This matches the official `@microsoft/workiq` MCP setup model (local stdio server), not a remote URL.
+
+Most users do not need to set tenant or account manually. WorkIQ uses your interactive login context.
+Use `--account` only if you have multiple cached accounts and need to force one.
+Use `--tenant-id` only to build/open the admin-consent URL for tenant admins.
+
+You can also run setup later with:
+
+```bash
+cmux init
+```
+
+### Pull and review WorkIQ items
+
+```bash
+cmux pull-workiq
+```
+
+`pull-workiq` talks directly to official `@microsoft/workiq` over stdio MCP.
+If `workiq_mcp_server` is set, cmux uses that only as a fallback bridge path.
+
+This fetches WorkIQ items and shows a numbered review table so you can choose exactly what to import.
+
+By default cmux fetches:
+- action emails
+- upcoming meeting prep items
+- assigned tasks
+- focus recommendations
+
+Selection prompt examples:
+- `1 3 5` → add specific items
+- `all` → add all fetched items
+- empty Enter → cancel
+
+### Add everything automatically
+
+```bash
+cmux pull-workiq --add-all
+```
+
+### Only assigned/tasks/email/meeting signals (skip focus recommendations)
+
+```bash
+cmux pull-workiq --no-focus
+```
+
+Imported WorkIQ tasks are tagged with source metadata and deduplicated by WorkIQ item id.
+
+### Auth and scope bootstrap
+
+```bash
+cmux workiq-auth
+```
+
+This runs WorkIQ consent/auth setup and a probe query so `pull-workiq` can access tenant data.
+It also opens Microsoft Entra in your browser by default to help complete sign-in/consent.
+The probe validates MCP readiness by listing available WorkIQ tools (it does not wait on a long ask response).
+
+Tenant/account scoped example:
+
+```bash
+cmux workiq-auth --account <email-or-account-id>
+```
+
+Tenant admin consent best-practice flow:
+
+```bash
+cmux workiq-auth --admin-consent --tenant-id <entra-tenant-id>
+```
+
+This opens the Microsoft admin-consent URL for the WorkIQ app so a tenant admin can grant organization-wide consent.
+
+---
+
 ## tmux Tips
 
 cmux creates a tmux session named `cmux`. Useful commands:
@@ -471,3 +569,11 @@ cmux> start 2       # pomodoro time
 **Skill not matching** — Use `cmux skills "your description"` to see match scores. Add keywords to custom skills for better matching.
 
 **Pane shows as LAUNCHING forever** — The backend detects status by parsing pane output. If Claude hasn't started writing yet, it shows as launching. Wait a moment and re-check with `cmux panes`.
+
+**Installer stops with PEP 668/external managed error** — Re-run `./install.sh`. The installer now detects this case and retries with `--break-system-packages` automatically.
+
+**Installer says no setup.py or pyproject.toml** — Ensure you're on the repository root and pull the latest changes. cmux now ships `pyproject.toml` for editable installs.
+
+**Need to use an HTTP MCP relay anyway** — Set `workiq_mcp_server` in `~/.cmux/config.yaml`. cmux now uses stdio first and HTTP as fallback when configured.
+**pull-workiq fails before returning items** — Ensure Node.js is installed and `npx -y @microsoft/workiq@latest mcp` works on your machine, then run `workiq accept-eula` if prompted by WorkIQ first-use requirements.
+**pull-workiq returns no items** — Run `cmux workiq-auth` and verify tenant/admin consent has been granted for your Microsoft 365 tenant.

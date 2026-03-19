@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 cmux/__init__.py
 cmux.egg-info/PKG-INFO
@@ -13,6 +14,8 @@ cmux/backend/copilot.py
 cmux/core/__init__.py
 cmux/core/cli.py
 cmux/core/config.py
+cmux/core/pomodoro.py
+cmux/core/repl.py
 cmux/core/session.py
 cmux/dashboard/__init__.py
 cmux/dashboard/stats.py

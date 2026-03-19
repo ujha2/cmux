@@ -43,7 +43,7 @@ def save_config(config: CmuxConfig) -> None:
 
 
 def read_claude_settings() -> dict:
-    """Read .claude/settings.json to discover MCP servers. Never writes to it."""
+    """Read .claude/settings.json to discover MCP servers."""
     if CLAUDE_SETTINGS.exists():
         with open(CLAUDE_SETTINGS) as f:
             return json.load(f)
@@ -54,3 +54,41 @@ def get_mcp_servers() -> list[str]:
     """Return list of MCP server names from Claude settings."""
     settings = read_claude_settings()
     return list(settings.get("mcpServers", {}).keys())
+
+
+def upsert_claude_mcp_command_server(
+    server_name: str,
+    command: str,
+    args: list[str] | None = None,
+    tools: list[str] | None = None,
+) -> None:
+    """Create or update a Claude MCP command server entry in ~/.claude/settings.json."""
+    settings = read_claude_settings()
+    mcp_servers = settings.setdefault("mcpServers", {})
+
+    entry: dict[str, object] = {
+        "command": command,
+        "args": args or [],
+    }
+    if tools:
+        entry["tools"] = tools
+
+    mcp_servers[server_name] = entry
+
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    with open(CLAUDE_SETTINGS, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
+def upsert_claude_mcp_http_server(server_name: str, server_url: str) -> None:
+    """Create or update a Claude MCP HTTP server entry in ~/.claude/settings.json."""
+    settings = read_claude_settings()
+    mcp_servers = settings.setdefault("mcpServers", {})
+    mcp_servers[server_name] = {
+        "transport": "http",
+        "url": server_url,
+    }
+
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    with open(CLAUDE_SETTINGS, "w") as f:
+        json.dump(settings, f, indent=2)

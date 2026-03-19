@@ -105,6 +105,8 @@ class CmuxConfig(BaseModel):
     template_skill_map: dict[str, list[str]] = Field(default_factory=dict)
     presets: dict[str, PresetConfig] = Field(default_factory=dict)
     workiq_mcp_server: str | None = None
+    workiq_tenant_id: str | None = None
+    workiq_account: str | None = None
 
 
 class TaskHistory(BaseModel):

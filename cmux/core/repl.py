@@ -12,6 +12,8 @@ HELP_TEXT = """[bold cyan]cmux commands:[/bold cyan]
   [green]add[/green] <description>     Add an agent task
   [green]add --human[/green] <desc>    Add a human task
   [green]start[/green] [index|id]      Start task(s) or interactive session
+    [green]pull-workiq[/green]           Import tasks from WorkIQ MCP
+    [green]workiq-auth[/green]           Run WorkIQ auth/consent flow
   [green]status[/green]                Show all tasks
   [green]stop[/green] [pane|all]       Stop sessions
   [green]review[/green]                Categorize pending tasks
@@ -76,6 +78,10 @@ def run_repl() -> None:
             _repl_add(arg)
         elif cmd == "start":
             _repl_start(arg)
+        elif cmd == "pull-workiq":
+            _repl_pull_workiq(arg)
+        elif cmd == "workiq-auth":
+            _repl_workiq_auth(arg)
         elif cmd == "stop":
             _repl_stop(arg)
         elif cmd == "review":
@@ -134,6 +140,26 @@ def _repl_start(arg: str) -> None:
         _do_start(arg.split() if arg else [])
     except (typer.Exit, SystemExit):
         pass
+
+
+def _repl_pull_workiq(arg: str) -> None:
+    from cmux.core.cli import pull_workiq as cli_pull_workiq
+    add_all = "--add-all" in arg.split()
+    no_focus = "--no-focus" in arg.split()
+    cli_pull_workiq(add_all=add_all, no_focus=no_focus)
+
+
+def _repl_workiq_auth(arg: str) -> None:
+    from cmux.core.cli import workiq_auth as cli_workiq_auth
+    parts = arg.split()
+    tenant_id = None
+    account = None
+    for i, tok in enumerate(parts):
+        if tok == "--tenant-id" and i + 1 < len(parts):
+            tenant_id = parts[i + 1]
+        if tok == "--account" and i + 1 < len(parts):
+            account = parts[i + 1]
+    cli_workiq_auth(tenant_id=tenant_id, account=account)
 
 
 def _repl_stop(arg: str) -> None:

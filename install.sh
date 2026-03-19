@@ -142,8 +142,32 @@ fi
 
 step "3/6  Installing cmux..."
 
-"$PYTHON" -m pip install --user -e "$CMUX_SRC" --quiet 2>&1 | tail -1
-info "cmux package installed"
+PIP_LOG="$(mktemp)"
+
+if "$PYTHON" -m pip install --user -e "$CMUX_SRC" --quiet >"$PIP_LOG" 2>&1; then
+    tail -1 "$PIP_LOG" || true
+    info "cmux package installed"
+else
+    if grep -qi "externally-managed-environment\|PEP 668" "$PIP_LOG"; then
+        warn "Detected a PEP 668 managed Python environment. Retrying with --break-system-packages..."
+        if "$PYTHON" -m pip install --user --break-system-packages -e "$CMUX_SRC" --quiet >"$PIP_LOG" 2>&1; then
+            tail -1 "$PIP_LOG" || true
+            info "cmux package installed"
+        else
+            err "pip install failed even after PEP 668 fallback."
+            tail -40 "$PIP_LOG"
+            rm -f "$PIP_LOG"
+            exit 1
+        fi
+    else
+        err "pip install failed"
+        tail -40 "$PIP_LOG"
+        rm -f "$PIP_LOG"
+        exit 1
+    fi
+fi
+
+rm -f "$PIP_LOG"
 
 # ─── 4. Add to PATH ──────────────────────────────────────────────────────────
 

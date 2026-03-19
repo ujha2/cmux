@@ -22,6 +22,22 @@ cmux/
 
 ## Data Flow
 
+### First-Run Setup Flow
+
+```
+First run (no ~/.cmux/config.yaml)
+    │
+    ▼
+load_config() -> defaults
+    │
+    ▼
+upsert ~/.claude/settings.json mcpServers.workiq
+with command: npx -y @microsoft/workiq@latest mcp
+    │
+    ▼
+save config
+```
+
 ### Task Lifecycle
 
 ```
@@ -56,6 +72,35 @@ cmux/
       │     _notify() → OS notification  │
       │     stats.record() → SQLite      │
       └─────────────────────────────────-┘
+```
+
+### WorkIQ Pull Flow
+
+```
+cmux pull-workiq
+    │
+    ▼
+load_config()
+    │
+    ▼
+WorkIQSource.fetch_tasks(include_focus=True)
+    │
+    ├─ stdio MCP (default): npx -y @microsoft/workiq@latest mcp
+    └─ HTTP MCP bridge (fallback): workiq_mcp_server when configured
+    │
+    ├─ MCP tool: get_action_emails
+    ├─ MCP tool: get_upcoming_meetings
+    ├─ MCP tool: get_assigned_tasks
+    └─ MCP tool: get_focus_recommendations (fallback get_priority_items)
+    │
+    ▼
+Interactive review table (or --add-all)
+    │
+    ▼
+TaskQueue.add() with source=workiq + metadata(workiq_id, workiq_type)
+    │
+    ▼
+Normal queue/start lifecycle
 ```
 
 ### Queue Persistence
@@ -145,6 +190,12 @@ The tradeoff is that completion detection only happens when you run a cmux comma
 - Textual is reserved for the dashboard TUI (heavier, full-screen app)
 - The REPL uses plain `console.input()` — no dependency on prompt_toolkit
 
+### Why keep install.sh despite pip install -e .?
+
+- Handles cross-platform dependency setup (tmux + PATH + context menus)
+- Detects PEP 668 managed Python environments and retries install with `--break-system-packages`
+- Initializes `~/.cmux` layout and starter config for first run
+
 ---
 
 ## Backend Interface
@@ -206,6 +257,7 @@ Skills are loaded from `~/.cmux/skills/` on each registry instantiation. The `te
 | Path | Purpose |
 |------|---------|
 | `~/.cmux/config.yaml` | Main configuration |
+| `~/.claude/settings.json` | Claude MCP server registry (includes `workiq` entry when configured) |
 | `~/.cmux/queue.json` | Task queue (all states) |
 | `~/.cmux/data/history.db` | SQLite stats database |
 | `~/.cmux/skills/*.yaml` | User-defined skills |

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import uuid
+import webbrowser
+import platform
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,12 +20,15 @@ from cmux.core.config import (
     DATA_DIR,
     SKILLS_DIR,
     TEMPLATES_DIR,
+    get_mcp_servers,
     load_config,
     save_config,
+    upsert_claude_mcp_command_server,
 )
 from cmux.skills.registry import SkillRegistry
 from cmux.tasks.models import Task, TaskType
 from cmux.tasks.queue import TaskQueue
+from cmux.tasks.sources.workiq import WorkIQSource
 from cmux.templates.cli import app as template_app
 from cmux.templates.loader import TemplateLoader
 
@@ -42,6 +49,7 @@ def main(ctx: typer.Context):
     # Auto-init if config doesn't exist
     if not CONFIG_FILE.exists():
         config = load_config()
+        _maybe_setup_workiq(config, first_time=True)
         save_config(config)
         console.print("[green]cmux auto-initialized.[/green]")
 
@@ -57,6 +65,174 @@ def _get_queue() -> TaskQueue:
 
 def _get_registry() -> SkillRegistry:
     return SkillRegistry(user_skills_dir=SKILLS_DIR)
+
+
+def _supports_interactive_prompts() -> bool:
+    """Return True when interactive prompts are likely safe."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _is_wsl() -> bool:
+    """Return True when running inside WSL."""
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except Exception:
+        return False
+
+
+def _open_url(url: str) -> bool:
+    """Best-effort URL open across native Linux, macOS, Windows, and WSL."""
+    if _is_wsl():
+        # Prefer wslview if available; fallback to Windows shell launch.
+        for cmd in (["wslview", url], ["cmd.exe", "/c", "start", "", url]):
+            try:
+                result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    return True
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return False
+
+    try:
+        if webbrowser.open(url):
+            return True
+    except Exception:
+        pass
+
+    system = platform.system()
+    commands: list[list[str]] = []
+    if system == "Darwin":
+        commands = [["open", url]]
+    elif system == "Linux":
+        commands = [["xdg-open", url], ["gio", "open", url]]
+    elif system == "Windows":
+        commands = [["cmd", "/c", "start", "", url]]
+
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                return True
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    return False
+
+
+def _maybe_setup_workiq(config, first_time: bool = False) -> None:
+    """Configure official @microsoft/workiq MCP registration defaults."""
+    mcp_name = "workiq"
+    mcp_command = "npx"
+    mcp_args = _build_workiq_mcp_args(config)
+
+    if _supports_interactive_prompts() and first_time:
+        console.print(
+            "[dim]Auto-configuring WorkIQ MCP:[/dim] "
+            "npx -y @microsoft/workiq@latest mcp"
+        )
+
+    existing = get_mcp_servers()
+    if existing and _supports_interactive_prompts():
+        console.print(f"[dim]Claude MCP servers detected:[/dim] {', '.join(existing)}")
+
+    save_config(config)
+
+    try:
+        upsert_claude_mcp_command_server(
+            server_name=mcp_name,
+            command=mcp_command,
+            args=mcp_args,
+            tools=["*"],
+        )
+        console.print("[green]WorkIQ configured and added to ~/.claude/settings.json[/green]")
+    except Exception as e:
+        console.print(f"[yellow]WorkIQ MCP registration failed:[/yellow] {e}")
+
+
+def _fetch_workiq_tasks(server_url: str, include_focus: bool = True):
+    """Fetch WorkIQ tasks via official stdio MCP (HTTP bridge optional fallback)."""
+    config = load_config()
+    source = WorkIQSource(
+        mcp_server_url=server_url,
+        mcp_args=_build_workiq_mcp_args(config),
+    )
+    try:
+        return source.fetch_tasks(include_focus=include_focus)
+    finally:
+        source.close()
+
+
+def _build_workiq_mcp_args(config) -> list[str]:
+    """Build WorkIQ CLI args aligned to official workiq global options."""
+    args = ["-y", "@microsoft/workiq@latest"]
+    if config.workiq_account:
+        args.extend(["--account", config.workiq_account])
+    args.append("mcp")
+    return args
+
+
+def _pick_workiq_tasks(tasks: list[Task], add_all: bool) -> list[Task]:
+    """Interactive selection for importing WorkIQ tasks."""
+    if not tasks:
+        return []
+    if add_all:
+        return tasks
+
+    table = Table(title="WorkIQ Suggestions")
+    table.add_column("#", width=4)
+    table.add_column("Type", width=10)
+    table.add_column("Task", style="cyan")
+    table.add_column("Priority", width=8, style="yellow")
+
+    for i, task in enumerate(tasks, 1):
+        item_type = task.metadata.get("workiq_type", "item")
+        table.add_row(f"#{i}", item_type, task.name, str(task.priority or 0))
+
+    console.print(table)
+
+    if not _supports_interactive_prompts():
+        console.print("[dim]Non-interactive terminal detected. Use --add-all to import automatically.[/dim]")
+        return []
+
+    try:
+        raw = console.input(
+            "\n[cyan]Select items to add (e.g. 1 3 5), 'all', or Enter to cancel:[/cyan] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return []
+
+    if not raw:
+        return []
+    if raw == "all":
+        return tasks
+
+    selected: list[Task] = []
+    seen: set[int] = set()
+    for tok in raw.split():
+        try:
+            idx = int(tok)
+        except ValueError:
+            continue
+        if 1 <= idx <= len(tasks) and idx not in seen:
+            selected.append(tasks[idx - 1])
+            seen.add(idx)
+    return selected
+
+
+def _is_duplicate_workiq_task(existing: list[Task], incoming: Task) -> bool:
+    """Detect duplicates by WorkIQ source id metadata."""
+    in_id = incoming.metadata.get("workiq_id")
+    in_type = incoming.metadata.get("workiq_type")
+    if not in_id:
+        return False
+    for item in existing:
+        if item.metadata.get("workiq_id") == in_id and item.metadata.get("workiq_type") == in_type:
+            return True
+    return False
 
 
 def _build_prompt_and_tools(task: Task, registry: SkillRegistry, config=None):
@@ -183,7 +359,7 @@ def _do_start(args: list[str]) -> None:
             break
 
     if launched:
-        console.print(f"\n[cyan]{launched} session(s) launched.[/cyan] Use 'cmux status' to monitor.")
+        console.print(f"\n[cyan]{launched} session(s) launched.[/cyan] Use 'status' to monitor.")
 
 
 def _launch_interactive(config) -> None:
@@ -328,7 +504,7 @@ def status():
     all_tasks = queue.all()
 
     if not all_tasks:
-        console.print("[dim]No tasks in queue. Use 'cmux add' to add one.[/dim]")
+        console.print("[dim]No tasks in queue. Use 'add' to add one.[/dim]")
         return
 
     # Separate pending (numbered) and non-pending
@@ -631,6 +807,7 @@ def uninstall_context_menu():
 def init():
     """Initialize cmux config and directories."""
     config = load_config()
+    _maybe_setup_workiq(config, first_time=False)
     save_config(config)
     console.print("[green]cmux initialized![/green]")
     console.print(f"  Config: ~/.cmux/config.yaml")
@@ -638,9 +815,142 @@ def init():
     console.print(f"  Skills: ~/.cmux/skills/")
     console.print(f"  Data: ~/.cmux/data/")
     console.print("\nNext steps:")
-    console.print("  cmux skills              — see available skills")
-    console.print("  cmux add 'description'   — add a task")
-    console.print("  cmux start               — start sessions")
+    console.print("  skills              — see available skills")
+    console.print("  workiq-auth         — run WorkIQ auth/consent flow")
+    console.print("  add 'description'   — add a task")
+    console.print("  pull-workiq         — import from Microsoft WorkIQ")
+    console.print("  start               — start sessions")
+
+
+@app.command("workiq-auth")
+def workiq_auth(
+    tenant_id: Optional[str] = typer.Option(None, "--tenant-id", help="Entra tenant ID (used for admin consent URL)"),
+    account: Optional[str] = typer.Option(None, "--account", help="Account hint to use for WorkIQ auth"),
+    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open browser for consent/sign-in guidance"),
+    admin_consent: bool = typer.Option(False, "--admin-consent", help="Open tenant admin consent URL (requires --tenant-id)"),
+):
+    """Run WorkIQ EULA/auth flow so pull-workiq can access tenant data."""
+    config = load_config()
+    if tenant_id:
+        config.workiq_tenant_id = tenant_id
+    if account:
+        config.workiq_account = account
+    save_config(config)
+
+    if open_browser:
+        opened = False
+        if admin_consent and config.workiq_tenant_id:
+            consent_url = (
+                f"https://login.microsoftonline.com/{config.workiq_tenant_id}"
+                "/adminconsent?client_id=ba081686-5d24-4bc6-a0d6-d034ecffed87"
+            )
+            opened = _open_url(consent_url)
+            if opened:
+                console.print(f"[cyan]Opened admin consent URL:[/cyan] {consent_url}")
+            else:
+                console.print(f"[yellow]Could not auto-open admin consent URL. Open manually:[/yellow] {consent_url}")
+        else:
+            # User/admin portal landing page when tenant consent workflow is needed.
+            entra_url = "https://entra.microsoft.com"
+            opened = _open_url(entra_url)
+            if opened:
+                console.print("[cyan]Opened Microsoft Entra portal for consent/sign-in checks.[/cyan]")
+            else:
+                console.print(f"[yellow]Could not auto-open browser. Open manually:[/yellow] {entra_url}")
+
+        if not opened:
+            if _is_wsl():
+                console.print("[dim]WSL tip: install wslu (wslview) or use Windows browser directly.[/dim]")
+
+    cmd = ["npx", "-y", "@microsoft/workiq@latest"]
+    if config.workiq_account:
+        cmd.extend(["--account", config.workiq_account])
+    cmd.append("accept-eula")
+
+    console.print("[cyan]Running WorkIQ consent/EULA flow...[/cyan]")
+    try:
+        subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        console.print("[red]npx not found. Install Node.js first.[/red]")
+        return
+
+    console.print("[cyan]Running WorkIQ MCP readiness probe...[/cyan]")
+    source = WorkIQSource(mcp_args=_build_workiq_mcp_args(config))
+    try:
+        tools = source.list_available_tools()
+    except Exception as e:
+        console.print(f"[yellow]WorkIQ probe failed:[/yellow] {e}")
+        console.print("[dim]Complete browser sign-in/consent, then rerun 'workiq-auth'.[/dim]")
+        console.print("[dim]If your org requires admin consent, run: workiq-auth --admin-consent --tenant-id <id>[/dim]")
+        return
+    finally:
+        source.close()
+
+    if tools:
+        preview = ", ".join(tools[:6])
+        more = "" if len(tools) <= 6 else f" (+{len(tools) - 6} more)"
+        console.print(f"[green]WorkIQ MCP ready.[/green] Detected tools: {preview}{more}")
+        console.print("[green]Auth flow complete. Try: cmux pull-workiq[/green]")
+    else:
+        console.print("[yellow]WorkIQ probe returned no tools.[/yellow]")
+        console.print("[dim]This usually means consent is incomplete. If needed, use --admin-consent with tenant id.[/dim]")
+
+
+@app.command("pull-workiq")
+def pull_workiq(
+    add_all: bool = typer.Option(False, "--add-all", help="Import all fetched WorkIQ items"),
+    no_focus: bool = typer.Option(False, "--no-focus", help="Skip focus recommendations"),
+):
+    """Fetch WorkIQ tasks via stdio MCP (HTTP fallback optional), then review/add."""
+    config = load_config()
+
+    if not config.workiq_mcp_server:
+        _maybe_setup_workiq(config, first_time=False)
+        console.print("[dim]Using official @microsoft/workiq stdio MCP transport.[/dim]")
+    else:
+        console.print("[dim]Using stdio MCP first; HTTP bridge fallback is configured.[/dim]")
+    if config.workiq_account:
+        console.print(f"[dim]WorkIQ account hint:[/dim] {config.workiq_account}")
+
+    try:
+        tasks = _fetch_workiq_tasks(config.workiq_mcp_server, include_focus=not no_focus)
+    except Exception as e:
+        console.print(f"[red]Failed to fetch from WorkIQ MCP:[/red] {e}")
+        console.print("[dim]Tip: run 'workiq-auth --open-browser' and, if needed, 'workiq-auth --admin-consent --tenant-id <id>'[/dim]")
+        return
+
+    if not tasks:
+        console.print("[dim]No WorkIQ items found right now.[/dim]")
+        return
+
+    selected = _pick_workiq_tasks(tasks, add_all=add_all)
+    if not selected:
+        console.print("[dim]No items selected.[/dim]")
+        return
+
+    queue = _get_queue()
+    registry = _get_registry()
+    existing = queue.all()
+
+    imported = 0
+    skipped = 0
+    for task in selected:
+        if _is_duplicate_workiq_task(existing, task):
+            skipped += 1
+            continue
+
+        if not task.skill:
+            matched = registry.auto_match(task.description)
+            if matched:
+                task.skill = matched.name
+
+        queue.add(task)
+        existing.append(task)
+        imported += 1
+
+    console.print(f"[green]Imported {imported} WorkIQ task(s).[/green]")
+    if skipped:
+        console.print(f"[dim]Skipped {skipped} duplicate item(s).[/dim]")
 
 
 if __name__ == "__main__":
