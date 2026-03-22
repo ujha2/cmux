@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import webbrowser
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import typer
 from rich.console import Console
@@ -148,6 +150,8 @@ def _maybe_setup_workiq(config, first_time: bool = False) -> None:
             args=mcp_args,
             tools=["*"],
         )
+        config.workiq_registered = True
+        save_config(config)
         console.print("[green]WorkIQ configured and added to ~/.claude/settings.json[/green]")
     except Exception as e:
         console.print(f"[yellow]WorkIQ MCP registration failed:[/yellow] {e}")
@@ -173,6 +177,59 @@ def _build_workiq_mcp_args(config) -> list[str]:
         args.extend(["--account", config.workiq_account])
     args.append("mcp")
     return args
+
+
+def _prewarm_workiq_npm() -> None:
+    """Pre-cache the @microsoft/workiq npm package to avoid cold-start MCP timeout."""
+    console.print("[dim]Ensuring WorkIQ npm package is ready...[/dim]")
+    try:
+        subprocess.run(
+            ["npx", "-y", "@microsoft/workiq@latest", "--version"],
+            capture_output=True, text=True, timeout=90,
+        )
+    except FileNotFoundError:
+        console.print("[red]npx not found. Install Node.js to use WorkIQ.[/red]")
+    except subprocess.TimeoutExpired:
+        console.print("[yellow]WorkIQ package download is slow. Proceeding anyway...[/yellow]")
+    except Exception:
+        pass
+
+
+def _run_with_progress(
+    label: str,
+    fn: Callable[[], Any],
+    *,
+    warn_after: float = 20.0,
+    notice_interval: float = 20.0,
+    timeout: float = 240.0,
+) -> Any:
+    """Run a blocking function with visible progress heartbeats and timeout."""
+    outcome: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            outcome["result"] = fn()
+        except Exception as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    start = time.time()
+    next_notice = warn_after
+    with console.status(f"[cyan]{label}[/cyan]", spinner="dots"):
+        while thread.is_alive():
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                raise TimeoutError(f"Operation timed out after {int(timeout)}s")
+            if elapsed >= next_notice:
+                console.print(f"[dim]Still working... {int(elapsed)}s elapsed.[/dim]")
+                next_notice += notice_interval
+            thread.join(0.2)
+
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
 
 
 def _pick_workiq_tasks(tasks: list[Task], add_all: bool) -> list[Task]:
@@ -877,7 +934,13 @@ def workiq_auth(
     console.print("[cyan]Running WorkIQ MCP readiness probe...[/cyan]")
     source = WorkIQSource(mcp_args=_build_workiq_mcp_args(config))
     try:
-        tools = source.list_available_tools()
+        tools = _run_with_progress(
+            "Checking WorkIQ MCP readiness",
+            source.list_available_tools,
+            warn_after=10,
+            notice_interval=15,
+            timeout=90,
+        )
     except Exception as e:
         console.print(f"[yellow]WorkIQ probe failed:[/yellow] {e}")
         console.print("[dim]Complete browser sign-in/consent, then rerun 'workiq-auth'.[/dim]")
@@ -890,7 +953,7 @@ def workiq_auth(
         preview = ", ".join(tools[:6])
         more = "" if len(tools) <= 6 else f" (+{len(tools) - 6} more)"
         console.print(f"[green]WorkIQ MCP ready.[/green] Detected tools: {preview}{more}")
-        console.print("[green]Auth flow complete. Try: cmux pull-workiq[/green]")
+        console.print("[green]Auth flow complete. Try: pull-workiq[/green]")
     else:
         console.print("[yellow]WorkIQ probe returned no tools.[/yellow]")
         console.print("[dim]This usually means consent is incomplete. If needed, use --admin-consent with tenant id.[/dim]")
@@ -904,16 +967,30 @@ def pull_workiq(
     """Fetch WorkIQ tasks via stdio MCP (HTTP fallback optional), then review/add."""
     config = load_config()
 
-    if not config.workiq_mcp_server:
+    if not config.workiq_registered:
         _maybe_setup_workiq(config, first_time=False)
-        console.print("[dim]Using official @microsoft/workiq stdio MCP transport.[/dim]")
-    else:
-        console.print("[dim]Using stdio MCP first; HTTP bridge fallback is configured.[/dim]")
+    console.print(
+        "[dim]Using stdio MCP first; HTTP bridge fallback is configured.[/dim]"
+        if config.workiq_mcp_server else
+        "[dim]Using official @microsoft/workiq stdio MCP transport.[/dim]"
+    )
     if config.workiq_account:
         console.print(f"[dim]WorkIQ account hint:[/dim] {config.workiq_account}")
 
+    _prewarm_workiq_npm()
+
     try:
-        tasks = _fetch_workiq_tasks(config.workiq_mcp_server, include_focus=not no_focus)
+        tasks = _run_with_progress(
+            "Fetching WorkIQ tasks",
+            lambda: _fetch_workiq_tasks(config.workiq_mcp_server, include_focus=not no_focus),
+            warn_after=15,
+            notice_interval=15,
+            timeout=240,
+        )
+    except TimeoutError:
+        console.print("[red]Fetch appears stuck (timed out after 240s).[/red]")
+        console.print("[dim]Try: workiq-auth --open-browser, then retry pull-workiq.[/dim]")
+        return
     except Exception as e:
         console.print(f"[red]Failed to fetch from WorkIQ MCP:[/red] {e}")
         console.print("[dim]Tip: run 'workiq-auth --open-browser' and, if needed, 'workiq-auth --admin-consent --tenant-id <id>'[/dim]")
@@ -940,7 +1017,8 @@ def pull_workiq(
             continue
 
         if not task.skill:
-            matched = registry.auto_match(task.description)
+            # Use task.name (short clean title) not description (may contain full response blob)
+            matched = registry.auto_match(task.name)
             if matched:
                 task.skill = matched.name
 

@@ -107,6 +107,7 @@ class CmuxConfig(BaseModel):
     workiq_mcp_server: str | None = None
     workiq_tenant_id: str | None = None
     workiq_account: str | None = None
+    workiq_registered: bool = False
 
 
 class TaskHistory(BaseModel):

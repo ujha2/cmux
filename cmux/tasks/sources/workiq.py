@@ -134,26 +134,38 @@ class WorkIQSource:
         )
 
         if not has_granular and ask_tool:
-            return self._fetch_tasks_via_ask(ask_tool, tool_defs.get(ask_tool), include_focus=include_focus)
+            return self._fetch_tasks_via_ask(
+                ask_tool, tool_defs.get(ask_tool),
+                include_focus=include_focus, tool_names=tool_names,
+            )
 
         return self._fetch_tasks_via_granular(tool_names, include_focus=include_focus)
 
-    def _fetch_tasks_via_ask(self, ask_tool: str, tool_def: dict[str, Any] | None, include_focus: bool = True) -> list[Task]:
+    def _fetch_tasks_via_ask(
+        self,
+        ask_tool: str,
+        tool_def: dict[str, Any] | None,
+        include_focus: bool = True,
+        tool_names: list[str] | None = None,
+    ) -> list[Task]:
         """Fetch tasks using the ask_work_iq conversational tool."""
+        focus_types = ', "FOCUS"' if include_focus else ""
         prompt = (
-            "List my actionable work items for today grouped as EMAIL, MEETING, TASK"
+            f'Return ONLY a JSON array, no prose. Each element must be a JSON object with exactly '
+            f'two string fields: "type" (one of: "EMAIL", "MEETING", "TASK"{focus_types}) and '
+            f'"title" (a short action phrase, max 10 words, no markdown formatting). '
+            f"List my actionable work items for today."
         )
-        if include_focus:
-            prompt += ", and FOCUS"
-        prompt += ". Return concise bullet points with one item per line."
 
         args = self._build_ask_args(tool_def, prompt)
         call_errors: list[str] = []
+        debug_url: str | None = None
 
         try:
             items = self._call_tool_stdio(ask_tool, args, timeout=120.0)
         except Exception as e:
             call_errors.append(f"{ask_tool}: {e}")
+            debug_url = self._fetch_debug_link(tool_names or [])
             items = self._fallback_cli_ask(prompt)
 
         tasks = self._tasks_from_ask_items(items)
@@ -161,10 +173,11 @@ class WorkIQSource:
             return tasks
 
         if call_errors:
+            debug_hint = f" Diagnostic link: {debug_url}" if debug_url else ""
             raise RuntimeError(
                 "WorkIQ ask tool calls failed or timed out. "
                 "Complete consent/auth with 'workiq-auth' and confirm tenant admin consent. "
-                f"Details: {' | '.join(call_errors[:3])}"
+                f"Details: {' | '.join(call_errors[:3])}{debug_hint}"
             )
 
         return []
@@ -208,34 +221,144 @@ class WorkIQSource:
         lines = [line.strip("- *\t ") for line in output.splitlines() if line.strip()]
         return [{"text": line} for line in lines]
 
+    def _parse_ask_response(self, blob: str) -> list[dict]:
+        """Split a markdown/JSON blob from ask_work_iq into individual item dicts.
+
+        Tries JSON array first (when the model follows the structured prompt).
+        Falls back to line-by-line markdown stripping grouped by section headers.
+        """
+        blob = blob.strip()
+
+        # Attempt 1: JSON array
+        # Strip common code-fence wrappers the LLM may add
+        json_blob = re.sub(r"^```(?:json)?\s*", "", blob)
+        json_blob = re.sub(r"\s*```$", "", json_blob).strip()
+        if json_blob.startswith("["):
+            try:
+                data = json.loads(json_blob)
+                if isinstance(data, list):
+                    return [i for i in data if isinstance(i, dict)]
+            except Exception:
+                pass
+
+        # Attempt 2: line-by-line cleanup with section tracking
+        current_section: str | None = None
+        items: list[dict] = []
+        for line in blob.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Detect markdown section headers: ## EMAIL, # MEETING, etc.
+            header_m = re.match(r"^#+\s*(\w+)", stripped)
+            if header_m:
+                current_section = header_m.group(1).lower()
+                continue
+            # Skip non-bullet prose lines when no section context yet
+            if not re.match(r"^[-*•]\s+", stripped) and not current_section:
+                continue
+            # Strip markdown formatting
+            text = re.sub(r"^[-*•]\s+", "", stripped)
+            text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+            text = re.sub(r"_{1,2}([^_]+)_{1,2}", r"\1", text)
+            text = re.sub(r"`([^`]+)`", r"\1", text).strip()
+            if text and len(text) > 3:
+                item: dict = {"text": text}
+                if current_section:
+                    item["section"] = current_section
+                items.append(item)
+        return items
+
+    def _fetch_debug_link(self, tool_names: list[str]) -> str | None:
+        """Call get_debug_link and return the URL if available. Never raises."""
+        debug_tool = self._resolve_tool(tool_names, ["get_debug_link"])
+        if not debug_tool:
+            return None
+        try:
+            items = self._call_tool_stdio(debug_tool, {}, timeout=15.0)
+            for item in items:
+                for key in ("url", "link", "debugLink", "debug_link", "text"):
+                    val = item.get(key, "")
+                    if isinstance(val, str) and val.startswith("http"):
+                        return val
+        except Exception:
+            pass
+        return None
+
     def _tasks_from_ask_items(self, items: list[dict]) -> list[Task]:
-        """Convert ask-style free text into queue tasks."""
+        """Convert ask-style items (JSON-structured or free text) into queue tasks."""
         tasks: list[Task] = []
         for i, item in enumerate(items, 1):
-            text = str(item.get("text") or item.get("summary") or item.get("description") or "").strip()
-            if not text:
+            # Prefer structured JSON fields (from JSON-prompt response)
+            json_type = str(item.get("type", "")).strip().lower()
+            json_title = str(item.get("title", "")).strip()
+
+            # Fall back to text/summary/description field
+            raw_text = str(item.get("text") or item.get("summary") or item.get("description") or "").strip()
+
+            # Unwrap JSON-wrapped text (e.g. {"response": "..."})
+            if raw_text.startswith("{") and raw_text.endswith("}"):
+                try:
+                    payload = json.loads(raw_text)
+                    if isinstance(payload, dict):
+                        raw_text = str(
+                            payload.get("response") or payload.get("text")
+                            or payload.get("summary") or raw_text
+                        ).strip()
+                except Exception:
+                    pass
+
+            title = json_title or raw_text
+            if not title:
                 continue
 
-            lowered = text.lower()
-            if re.search(r"\b(email|inbox|reply)\b", lowered):
-                kind = "email"
-                desc = f"Respond to email: {text}"
-                priority = 0
-            elif re.search(r"\b(meeting|calendar|prep)\b", lowered):
-                kind = "meeting"
-                desc = f"Prepare for meeting: {text}"
-                priority = 0
-            elif re.search(r"\b(focus|priority|urgent|top)\b", lowered):
-                kind = "focus"
-                desc = f"Focus recommendation: {text}"
-                priority = 5
+            # Strip residual markdown from the title
+            clean_title = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", title)
+            clean_title = re.sub(r"_{1,2}([^_]+)_{1,2}", r"\1", clean_title)
+            clean_title = re.sub(r"`([^`]+)`", r"\1", clean_title).strip()
+
+            # Determine task kind: JSON type > section header > regex on text
+            section = item.get("section", "").lower()
+            if json_type == "email":
+                kind, priority = "email", 0
+                desc = f"Respond to email: {clean_title}"
+            elif json_type == "meeting":
+                kind, priority = "meeting", 0
+                desc = f"Prepare for meeting: {clean_title}"
+            elif json_type == "focus":
+                kind, priority = "focus", 5
+                desc = f"Focus: {clean_title}"
+            elif json_type == "task":
+                kind, priority = "task", 0
+                desc = clean_title
+            elif section in ("email", "inbox"):
+                kind, priority = "email", 0
+                desc = f"Respond to email: {clean_title}"
+            elif section in ("meeting", "calendar"):
+                kind, priority = "meeting", 0
+                desc = f"Prepare for meeting: {clean_title}"
+            elif section in ("focus", "priority"):
+                kind, priority = "focus", 5
+                desc = f"Focus: {clean_title}"
+            elif section in ("task", "tasks"):
+                kind, priority = "task", 0
+                desc = clean_title
             else:
-                kind = "task"
-                desc = text
-                priority = 0
+                lowered = clean_title.lower()
+                if re.search(r"\b(email|inbox|reply)\b", lowered):
+                    kind, priority = "email", 0
+                    desc = f"Respond to email: {clean_title}"
+                elif re.search(r"\b(meeting|calendar|prep)\b", lowered):
+                    kind, priority = "meeting", 0
+                    desc = f"Prepare for meeting: {clean_title}"
+                elif re.search(r"\b(focus|priority|urgent|top)\b", lowered):
+                    kind, priority = "focus", 5
+                    desc = f"Focus: {clean_title}"
+                else:
+                    kind, priority = "task", 0
+                    desc = clean_title
 
             tasks.append(Task(
-                name=f"{kind}-{text[:25] or i}",
+                name=f"{kind}-{clean_title[:30] or i}",
                 description=desc,
                 source="workiq",
                 priority=priority,
@@ -550,7 +673,11 @@ class WorkIQSource:
                 if not isinstance(part, dict):
                     continue
                 if isinstance(part.get("text"), str):
-                    items.append({"text": part.get("text")})
+                    text_val = part["text"]
+                    if "\n" in text_val:
+                        items.extend(self._parse_ask_response(text_val))
+                    else:
+                        items.append({"text": text_val})
                 if isinstance(part.get("json"), list):
                     items.extend([i for i in part["json"] if isinstance(i, dict)])
                 elif isinstance(part.get("json"), dict):
