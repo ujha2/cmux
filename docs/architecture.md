@@ -31,8 +31,15 @@ First run (no ~/.cmux/config.yaml)
 load_config() -> defaults
     │
     ▼
-upsert ~/.claude/settings.json mcpServers.workiq
-with command: npx -y @microsoft/workiq@latest mcp
+_maybe_setup_workiq(config, first_time=True)
+    │
+    ├─ save_config(config)
+    └─ upsert ~/.claude/settings.json mcpServers.workiq
+       command: npx
+       args: -y @microsoft/workiq@latest [--account <hint>] mcp
+    │
+    ▼
+set config.workiq_registered = true
     │
     ▼
 save config
@@ -70,8 +77,27 @@ save config
       ┌──────────────────────────────────┐
       │          done / error            │
       │     _notify() → OS notification  │
-      │     stats.record() → SQLite      │
+            │  queue persisted in queue.json   │
       └─────────────────────────────────-┘
+```
+
+### WorkIQ Auth Flow
+
+```
+cmux workiq-auth [--tenant-id] [--account]
+    │
+    ▼
+save_config(workiq_tenant_id/workiq_account)
+    │
+    ├─ optional browser open
+    │   ├─ admin consent URL when --admin-consent + tenant id
+    │   └─ Entra portal otherwise
+    │
+    ├─ run: npx -y @microsoft/workiq@latest [--account] accept-eula
+    │
+    └─ MCP readiness probe: list_available_tools()
+       ├─ success: print detected tools
+       └─ failure: guidance to re-run auth/admin consent
 ```
 
 ### WorkIQ Pull Flow
@@ -83,21 +109,28 @@ cmux pull-workiq
 load_config()
     │
     ▼
+prewarm npm package (npx ... --version)
+    │
+    ▼
 WorkIQSource.fetch_tasks(include_focus=True)
     │
     ├─ stdio MCP (default): npx -y @microsoft/workiq@latest mcp
     └─ HTTP MCP bridge (fallback): workiq_mcp_server when configured
     │
-    ├─ MCP tool: get_action_emails
-    ├─ MCP tool: get_upcoming_meetings
-    ├─ MCP tool: get_assigned_tasks
-    └─ MCP tool: get_focus_recommendations (fallback get_priority_items)
+    ├─ granular tools when available
+    │   ├─ get_action_emails
+    │   ├─ get_upcoming_meetings
+    │   ├─ get_assigned_tasks
+    │   └─ get_focus_recommendations (fallback get_priority_items)
+    └─ else ask_work_iq strategy (CLI ask fallback on call timeout)
     │
     ▼
 Interactive review table (or --add-all)
     │
     ▼
 TaskQueue.add() with source=workiq + metadata(workiq_id, workiq_type)
+    │
+    └─ dedupe by (workiq_id, workiq_type)
     │
     ▼
 Normal queue/start lifecycle
@@ -108,6 +141,8 @@ Normal queue/start lifecycle
 `~/.cmux/queue.json` is the single source of truth for task state. It's a flat JSON array of serialized Task objects. Every mutating operation calls `_save()` immediately.
 
 The queue is loaded fresh on each CLI invocation (`TaskQueue.__init__` → `_load()`). There's no in-memory daemon — cmux is stateless between commands, with the JSON file as the shared state.
+
+A current implementation caveat: `SessionManager` keeps pane→task mapping in memory per invocation. Pane state checks update that in-memory map, but durable lifecycle truth for CLI views still comes from `queue.json`.
 
 ### Session Manager ↔ Backend
 
@@ -263,7 +298,7 @@ Skills are loaded from `~/.cmux/skills/` on each registry instantiation. The `te
 | `~/.cmux/skills/*.yaml` | User-defined skills |
 | `~/.cmux/templates/*.md` | Prompt templates |
 | `./cmux-output/{date}/{task}/` | Default output directory |
-| `./cmux-tasks.yaml` | Local task file (auto-loaded by `start`) |
+| `~/.cmux/tasks.yaml` | Reserved task source path constant (not auto-loaded by default) |
 
 ---
 
@@ -274,6 +309,7 @@ Skills are loaded from `~/.cmux/skills/` on each registry instantiation. The `te
 - **Backend not implemented:** `NotImplementedError` from copilot backend → shown to user
 - **Corrupt queue.json:** `_load()` catches all exceptions → starts with empty queue
 - **Missing config:** `load_config()` returns defaults → auto-init creates file
+- **WorkIQ MCP/tool timeout:** `pull-workiq` has heartbeat + timeout messages and explicit auth/consent remediation hints
 
 ---
 
